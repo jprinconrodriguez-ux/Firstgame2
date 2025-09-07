@@ -5,6 +5,8 @@ local GS   = require("gamestate")  -- Gamestate
 local Rules= require("rules")      -- NEW: sorting + categories
 local Scoring = require("scoring")
 local Attacks = require("attacks")
+local Jokers = require("jokers")
+local JokerReg = require("joker_registry")
 
 -- === CONSTANTS (safe defaults) ===
 local HAND_START = HAND_START or 10   -- starting hand size
@@ -15,6 +17,7 @@ local NUM_DECKS  = NUM_DECKS  or 2    -- SP default; MP later = players + 1
 local deck
 local hand = {}          -- make sure 'hand' exists before helpers use it
 local selected = {}
+local selectedJoker = nil
 local lastResult = nil
 local statusMsg = ""
 local moveCount = 0      -- legacy display; GS.moves is the canonical count
@@ -111,6 +114,8 @@ end
   return drawnCount
 end
 
+S.drawCards = drawN
+
 local function drawUpTo(target)
   target = math.min(target or HAND_START, HAND_MAX)
   local total = 0
@@ -138,6 +143,11 @@ local CARD_W, CARD_H = 80, 110
 local HAND_X, HAND_Y = 40, 380
 local GAP = 12
 
+-- Joker layout
+local JOKER_W, JOKER_H = 60, 90
+local JOKER_X, JOKER_Y = 40, 210
+local JOKER_GAP = 10
+
 -- Selection helpers
 local function selectedIndices()
   local idxs = {}
@@ -151,6 +161,41 @@ local function cardsFromIndices(idxs)
   local t = {}
   for _, i in ipairs(idxs) do table.insert(t, hand[i]) end
   return t
+end
+
+local function jokerPos(i)
+  local x = JOKER_X + (i-1) * (JOKER_W + JOKER_GAP)
+  local y = JOKER_Y
+  return x, y
+end
+
+local function drawJoker(jid, i)
+  local x, y = jokerPos(i)
+  local def = JokerReg.by_id[jid]
+  love.graphics.setColor(1,1,1)
+  love.graphics.rectangle("fill", x, y, JOKER_W, JOKER_H, 8, 8)
+  love.graphics.setColor(0,0,0)
+  love.graphics.rectangle("line", x, y, JOKER_W, JOKER_H, 8, 8)
+  local label = def and def.name or tostring(jid)
+  love.graphics.printf(label, x+4, y + JOKER_H/2 - 8, JOKER_W-8, "center")
+  if selectedJoker == i then
+    love.graphics.setColor(1, 0.9, 0.3, 0.35)
+    love.graphics.rectangle("fill", x, y, JOKER_W, JOKER_H, 8, 8)
+    love.graphics.setColor(0.8,0.5,0)
+    love.graphics.rectangle("line", x+2, y+2, JOKER_W-4, JOKER_H-4, 8, 8)
+  end
+  love.graphics.setColor(1,1,1)
+end
+
+local function jokerAtPosition(x, y)
+  if not S.jokers or not S.jokers.hand then return nil end
+  for i = 1, #S.jokers.hand do
+    local jx, jy = jokerPos(i)
+    if x >= jx and x <= jx + JOKER_W and y >= jy and y <= jy + JOKER_H then
+      return i
+    end
+  end
+  return nil
 end
 
 -- === CHECKLIST / WIN HELPERS ===
@@ -191,8 +236,10 @@ nextTurn = function()
   GS.turn = (GS.turn or 1) + 1
   setStatus("Your turn.")
   selected = {}  -- ensure clean state
+  selectedJoker = nil
   if Scoring and not S.meta then Scoring.init(S) end
   if Attacks then Attacks.announce(S, love.math) end
+  if Jokers then Jokers.start_turn(S) end
 end
 
 -- Discard (up to 5) and redraw same amount (respect HAND_MAX)
@@ -254,11 +301,25 @@ local function buildSaveState()
   }
   for k,v in pairs(GS.playedHands) do gs.playedHands[k] = v and true or nil end
 
+  local jokerState
+  if S.jokers then
+    jokerState = {
+      pool = {},
+      hand = {},
+      played_pile = {},
+      used_this_turn = S.jokers.used_this_turn
+    }
+    for i,id in ipairs(S.jokers.pool or {}) do jokerState.pool[i] = id end
+    for i,id in ipairs(S.jokers.hand or {}) do jokerState.hand[i] = id end
+    for i,id in ipairs(S.jokers.played_pile or {}) do jokerState.played_pile[i] = id end
+  end
+
   return {
     version = 1,
     hand    = handCopy,
     deck    = deckState,
     gs      = gs,
+    jokers  = jokerState,
     meta    = { timestamp = os.time() }
   }
 end
@@ -284,6 +345,19 @@ local function applyLoadedState(state)
   end
   GS.limits = state.gs and state.gs.limits or { joker_played_this_turn = false }
   GS.meta   = state.gs and state.gs.meta or { run_id = 1 }
+
+  if Jokers then
+    Jokers.init(S, love.math)
+    if state.jokers then
+      S.jokers.pool = {}
+      S.jokers.hand = {}
+      S.jokers.played_pile = {}
+      for i,id in ipairs(state.jokers.pool or {}) do S.jokers.pool[i] = id end
+      for i,id in ipairs(state.jokers.hand or {}) do S.jokers.hand[i] = id end
+      for i,id in ipairs(state.jokers.played_pile or {}) do S.jokers.played_pile[i] = id end
+      S.jokers.used_this_turn = state.jokers.used_this_turn
+    end
+  end
 
   -- local cleans
   selected = {}
@@ -328,6 +402,10 @@ end
 local function restartGame()
   deck = Deck.new(NUM_DECKS)
   if Scoring then Scoring.init(S) end
+  if Jokers then
+    Jokers.init(S, love.math)
+    Jokers.start_turn(S)
+  end
   if Attacks then Attacks.announce(S, love.math) end
   hand = {}
   selected = {}
@@ -490,6 +568,12 @@ function love.mousepressed(x, y, b)
     return
   end
 
+  local ji = jokerAtPosition(x, y)
+  if ji then
+    selectedJoker = (selectedJoker == ji) and nil or ji
+    return
+  end
+
   local i = cardAtPosition(x, y)
   if i then
     selected[i] = not selected[i]
@@ -559,13 +643,15 @@ function love.keypressed(key)
       GS.moves = GS.moves + 1
 
       -- Award score & mark for attack resolution
+      local msg = "Played: "..cat.."  |  Drew "..tostring(got)
       if Scoring then
         local gained = Scoring.apply_award(S, cat)
-        setStatus("Played: "..cat.."  |  +"..tostring(gained).." pts  |  Drew "..tostring(got))
+        msg = "Played: "..cat.."  |  +"..tostring(gained).." pts  |  Drew "..tostring(got)
       end
+      setStatus(msg)
       if Attacks then Attacks.note_played_this_turn(S, cat) end
+      if Jokers then Jokers.on_hand_played(S, love.math) end
 
-      setStatus("Played: "..cat.."  |  Drew "..tostring(got))
       tryWin()
       if GS.phase ~= "WIN" then
         enterEndPhase()
@@ -630,6 +716,28 @@ function love.keypressed(key)
       setStatus("No top-up needed.")
     end
 
+  elseif key == "j" then
+    if GS.phase == "WIN" then
+      setStatus("Game won—press R to restart.")
+      return
+    end
+    if GS.phase == "END" then
+      setStatus("Turn advanced automatically.")
+      return
+    end
+    local idx = selectedJoker or 1
+    if Jokers and Jokers.can_use(S) and S.jokers and S.jokers.hand[idx] then
+      local res = Jokers.use(S, idx, {source="key"})
+      selectedJoker = nil
+      if res and res.msg then
+        setStatus(res.msg)
+      else
+        setStatus("Used joker.")
+      end
+    else
+      setStatus("No joker ready.")
+    end
+
   elseif key == "c" then
     if GS.phase == "WIN" then
       setStatus("Game won—press R to restart.")
@@ -656,6 +764,17 @@ function love.keypressed(key)
 end
 
 function love.draw()
+  if statusMsg and statusMsg ~= "" then
+    local sx, sy = 40, 70
+    local sw = math.min(font:getWidth(statusMsg) + 20, love.graphics.getWidth() - 80)
+    local sh = 28
+    love.graphics.setColor(0,0,0,0.45)
+    love.graphics.rectangle("fill", sx, sy, sw, sh, 6, 6)
+    love.graphics.setColor(1,1,1,1)
+    love.graphics.print(statusMsg, sx + 10, sy + 6)
+  end
+
+  love.graphics.setColor(1,1,1)
   love.graphics.print("Click to select. Enter=Play (1–5). X=Discard (≤5). Turns auto-advance. R=Restart.", 40, 30)
   local deckCount    = (deck and deck.cards)   and #deck.cards   or 0
   local discardCount = (deck and deck.discard) and #deck.discard or 0
@@ -675,6 +794,14 @@ function love.draw()
 -- Checklist UI (2.2) + win / end banners
   drawChecklistUI()
 
+  -- Jokers row
+  if S.jokers and S.jokers.hand and #S.jokers.hand > 0 then
+    love.graphics.print("Jokers:", JOKER_X, JOKER_Y - 20)
+    for i, jid in ipairs(S.jokers.hand) do
+      drawJoker(jid, i)
+    end
+  end
+
   -- Hand
   for i, c in ipairs(hand) do
     drawCard(c, i)
@@ -682,13 +809,5 @@ function love.draw()
 
   if lastResult and lastResult.exact then
     love.graphics.print("Last Played: "..lastResult.exact, 40, 145)
-  end
-  -- Status HUD (top-left banner)
-  if statusMsg and statusMsg ~= "" then
-    local sx, sy, sw, sh = 40, 70, math.min(720, love.graphics.getWidth() - 80), 28
-    love.graphics.setColor(0,0,0,0.45)
-    love.graphics.rectangle("fill", sx, sy, sw, sh, 6, 6)
-    love.graphics.setColor(1,1,1,1)
-    love.graphics.print(statusMsg, sx + 10, sy + 6)
   end
 end
